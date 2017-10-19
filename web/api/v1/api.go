@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"net/url"
 	"strconv"
 	"time"
 
@@ -28,11 +27,9 @@ import (
 	"github.com/prometheus/common/route"
 	"golang.org/x/net/context"
 
-	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/retrieval"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/httputil"
 )
@@ -71,14 +68,6 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("%s: %s", e.typ, e.err)
 }
 
-type targetRetriever interface {
-	Targets() []*retrieval.Target
-}
-
-type alertmanagerRetriever interface {
-	Alertmanagers() []*url.URL
-}
-
 type response struct {
 	Status    status      `json:"status"`
 	Data      interface{} `json:"data,omitempty"`
@@ -101,31 +90,21 @@ type API struct {
 	Queryable   promql.Queryable
 	QueryEngine *promql.Engine
 
-	targetRetriever       targetRetriever
-	alertmanagerRetriever alertmanagerRetriever
-
-	now    func() time.Time
-	config func() config.Config
-	ready  func(http.HandlerFunc) http.HandlerFunc
+	now   func() time.Time
+	ready func(http.HandlerFunc) http.HandlerFunc
 }
 
 // NewAPI returns an initialized API type.
 func NewAPI(
 	qe *promql.Engine,
 	q promql.Queryable,
-	tr targetRetriever,
-	ar alertmanagerRetriever,
-	configFunc func() config.Config,
 	readyFunc func(http.HandlerFunc) http.HandlerFunc,
 ) *API {
 	return &API{
-		QueryEngine:           qe,
-		Queryable:             q,
-		targetRetriever:       tr,
-		alertmanagerRetriever: ar,
-		now:    time.Now,
-		config: configFunc,
-		ready:  readyFunc,
+		QueryEngine: qe,
+		Queryable:   q,
+		now:         time.Now,
+		ready:       readyFunc,
 	}
 }
 
@@ -156,11 +135,6 @@ func (api *API) Register(r *route.Router) {
 
 	r.Get("/series", instr("series", api.series))
 	r.Del("/series", instr("drop_series", api.dropSeries))
-
-	r.Get("/targets", instr("targets", api.targets))
-	r.Get("/alertmanagers", instr("alertmanagers", api.alertmanagers))
-
-	r.Get("/status/config", instr("config", api.serveConfig))
 }
 
 type queryData struct {
@@ -385,70 +359,8 @@ type Target struct {
 
 	ScrapeURL string `json:"scrapeUrl"`
 
-	LastError  string                 `json:"lastError"`
-	LastScrape time.Time              `json:"lastScrape"`
-	Health     retrieval.TargetHealth `json:"health"`
-}
-
-// TargetDiscovery has all the active targets.
-type TargetDiscovery struct {
-	ActiveTargets []*Target `json:"activeTargets"`
-}
-
-func (api *API) targets(r *http.Request) (interface{}, *apiError) {
-	targets := api.targetRetriever.Targets()
-	res := &TargetDiscovery{ActiveTargets: make([]*Target, len(targets))}
-
-	for i, t := range targets {
-		lastErrStr := ""
-		lastErr := t.LastError()
-		if lastErr != nil {
-			lastErrStr = lastErr.Error()
-		}
-
-		res.ActiveTargets[i] = &Target{
-			DiscoveredLabels: t.DiscoveredLabels().Map(),
-			Labels:           t.Labels().Map(),
-			ScrapeURL:        t.URL().String(),
-			LastError:        lastErrStr,
-			LastScrape:       t.LastScrape(),
-			Health:           t.Health(),
-		}
-	}
-
-	return res, nil
-}
-
-// AlertmanagerDiscovery has all the active Alertmanagers.
-type AlertmanagerDiscovery struct {
-	ActiveAlertmanagers []*AlertmanagerTarget `json:"activeAlertmanagers"`
-}
-
-// AlertmanagerTarget has info on one AM.
-type AlertmanagerTarget struct {
-	URL string `json:"url"`
-}
-
-func (api *API) alertmanagers(r *http.Request) (interface{}, *apiError) {
-	urls := api.alertmanagerRetriever.Alertmanagers()
-	ams := &AlertmanagerDiscovery{ActiveAlertmanagers: make([]*AlertmanagerTarget, len(urls))}
-
-	for i, url := range urls {
-		ams.ActiveAlertmanagers[i] = &AlertmanagerTarget{URL: url.String()}
-	}
-
-	return ams, nil
-}
-
-type prometheusConfig struct {
-	YAML string `json:"yaml"`
-}
-
-func (api *API) serveConfig(r *http.Request) (interface{}, *apiError) {
-	cfg := &prometheusConfig{
-		YAML: api.config().String(),
-	}
-	return cfg, nil
+	LastError  string    `json:"lastError"`
+	LastScrape time.Time `json:"lastScrape"`
 }
 
 func respond(w http.ResponseWriter, data interface{}) {
