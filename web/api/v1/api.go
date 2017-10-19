@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
 	"golang.org/x/net/context"
@@ -31,7 +30,6 @@ import (
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/util/httputil"
 )
 
 type status string
@@ -121,12 +119,8 @@ func (api *API) Register(r *route.Router) {
 				w.WriteHeader(http.StatusNoContent)
 			}
 		})
-		return api.ready(prometheus.InstrumentHandler(name, httputil.CompressionHandler{
-			Handler: hf,
-		}))
+		return api.ready(hf)
 	}
-
-	r.Options("/*path", instr("options", api.options))
 
 	r.Get("/query", instr("query", api.query))
 	r.Get("/query_range", instr("query_range", api.queryRange))
