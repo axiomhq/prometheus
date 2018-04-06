@@ -21,27 +21,20 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/tsdb"
 
-	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/storage/remote"
-	"github.com/prometheus/prometheus/util/httputil"
 	"github.com/prometheus/prometheus/util/stats"
 	tsdbLabels "github.com/prometheus/tsdb/labels"
 )
@@ -81,16 +74,6 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("%s: %s", e.typ, e.err)
 }
 
-type targetRetriever interface {
-	Targets() []*scrape.Target
-	DroppedTargets() []*scrape.Target
-}
-
-type alertmanagerRetriever interface {
-	Alertmanagers() []*url.URL
-	DroppedAlertmanagers() []*url.URL
-}
-
 type response struct {
 	Status    status      `json:"status"`
 	Data      interface{} `json:"data,omitempty"`
@@ -113,13 +96,8 @@ type API struct {
 	Queryable   storage.Queryable
 	QueryEngine *promql.Engine
 
-	targetRetriever       targetRetriever
-	alertmanagerRetriever alertmanagerRetriever
-
-	now      func() time.Time
-	config   func() config.Config
-	flagsMap map[string]string
-	ready    func(http.HandlerFunc) http.HandlerFunc
+	now   func() time.Time
+	ready func(http.HandlerFunc) http.HandlerFunc
 
 	db          func() *tsdb.DB
 	enableAdmin bool
@@ -129,22 +107,14 @@ type API struct {
 func NewAPI(
 	qe *promql.Engine,
 	q storage.Queryable,
-	tr targetRetriever,
-	ar alertmanagerRetriever,
-	configFunc func() config.Config,
-	flagsMap map[string]string,
 	readyFunc func(http.HandlerFunc) http.HandlerFunc,
 	db func() *tsdb.DB,
 	enableAdmin bool,
 ) *API {
 	return &API{
-		QueryEngine:           qe,
-		Queryable:             q,
-		targetRetriever:       tr,
-		alertmanagerRetriever: ar,
+		QueryEngine: qe,
+		Queryable:   q,
 		now:         time.Now,
-		config:      configFunc,
-		flagsMap:    flagsMap,
 		ready:       readyFunc,
 		db:          db,
 		enableAdmin: enableAdmin,
@@ -164,12 +134,9 @@ func (api *API) Register(r *route.Router) {
 				w.WriteHeader(http.StatusNoContent)
 			}
 		})
-		return api.ready(prometheus.InstrumentHandler(name, httputil.CompressionHandler{
-			Handler: hf,
-		}))
-	}
+		return api.ready(hf)
 
-	r.Options("/*path", instr("options", api.options))
+	}
 
 	r.Get("/query", instr("query", api.query))
 	r.Post("/query", instr("query", api.query))
@@ -180,13 +147,6 @@ func (api *API) Register(r *route.Router) {
 
 	r.Get("/series", instr("series", api.series))
 	r.Del("/series", instr("drop_series", api.dropSeries))
-
-	r.Get("/targets", instr("targets", api.targets))
-	r.Get("/alertmanagers", instr("alertmanagers", api.alertmanagers))
-
-	r.Get("/status/config", instr("config", api.serveConfig))
-	r.Get("/status/flags", instr("flags", api.serveFlags))
-	r.Post("/read", api.ready(prometheus.InstrumentHandler("read", http.HandlerFunc(api.remoteRead))))
 
 	// Admin APIs
 	r.Post("/admin/tsdb/delete_series", instr("delete_series", api.deleteSeries))
@@ -433,169 +393,6 @@ type Target struct {
 	Labels map[string]string `json:"labels"`
 
 	ScrapeURL string `json:"scrapeUrl"`
-
-	LastError  string              `json:"lastError"`
-	LastScrape time.Time           `json:"lastScrape"`
-	Health     scrape.TargetHealth `json:"health"`
-}
-
-// DroppedTarget has the information for one target that was dropped during relabelling.
-type DroppedTarget struct {
-	// Labels before any processing.
-	DiscoveredLabels map[string]string `json:"discoveredLabels"`
-}
-
-// TargetDiscovery has all the active targets.
-type TargetDiscovery struct {
-	ActiveTargets  []*Target        `json:"activeTargets"`
-	DroppedTargets []*DroppedTarget `json:"droppedTargets"`
-}
-
-func (api *API) targets(r *http.Request) (interface{}, *apiError) {
-	targets := api.targetRetriever.Targets()
-	droppedTargets := api.targetRetriever.DroppedTargets()
-	res := &TargetDiscovery{ActiveTargets: make([]*Target, len(targets)), DroppedTargets: make([]*DroppedTarget, len(droppedTargets))}
-
-	for i, t := range targets {
-		lastErrStr := ""
-		lastErr := t.LastError()
-		if lastErr != nil {
-			lastErrStr = lastErr.Error()
-		}
-
-		res.ActiveTargets[i] = &Target{
-			DiscoveredLabels: t.DiscoveredLabels().Map(),
-			Labels:           t.Labels().Map(),
-			ScrapeURL:        t.URL().String(),
-			LastError:        lastErrStr,
-			LastScrape:       t.LastScrape(),
-			Health:           t.Health(),
-		}
-	}
-
-	for i, t := range droppedTargets {
-		res.DroppedTargets[i] = &DroppedTarget{
-			DiscoveredLabels: t.DiscoveredLabels().Map(),
-		}
-	}
-
-	return res, nil
-}
-
-// AlertmanagerDiscovery has all the active Alertmanagers.
-type AlertmanagerDiscovery struct {
-	ActiveAlertmanagers  []*AlertmanagerTarget `json:"activeAlertmanagers"`
-	DroppedAlertmanagers []*AlertmanagerTarget `json:"droppedAlertmanagers"`
-}
-
-// AlertmanagerTarget has info on one AM.
-type AlertmanagerTarget struct {
-	URL string `json:"url"`
-}
-
-func (api *API) alertmanagers(r *http.Request) (interface{}, *apiError) {
-	urls := api.alertmanagerRetriever.Alertmanagers()
-	droppedURLS := api.alertmanagerRetriever.DroppedAlertmanagers()
-	ams := &AlertmanagerDiscovery{ActiveAlertmanagers: make([]*AlertmanagerTarget, len(urls)), DroppedAlertmanagers: make([]*AlertmanagerTarget, len(droppedURLS))}
-	for i, url := range urls {
-		ams.ActiveAlertmanagers[i] = &AlertmanagerTarget{URL: url.String()}
-	}
-	for i, url := range droppedURLS {
-		ams.DroppedAlertmanagers[i] = &AlertmanagerTarget{URL: url.String()}
-	}
-	return ams, nil
-}
-
-type prometheusConfig struct {
-	YAML string `json:"yaml"`
-}
-
-func (api *API) serveConfig(r *http.Request) (interface{}, *apiError) {
-	cfg := &prometheusConfig{
-		YAML: api.config().String(),
-	}
-	return cfg, nil
-}
-
-func (api *API) serveFlags(r *http.Request) (interface{}, *apiError) {
-	return api.flagsMap, nil
-}
-
-func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
-	req, err := remote.DecodeReadRequest(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	resp := prompb.ReadResponse{
-		Results: make([]*prompb.QueryResult, len(req.Queries)),
-	}
-	for i, query := range req.Queries {
-		from, through, matchers, err := remote.FromQuery(query)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		querier, err := api.Queryable.Querier(r.Context(), from, through)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer querier.Close()
-
-		// Change equality matchers which match external labels
-		// to a matcher that looks for an empty label,
-		// as that label should not be present in the storage.
-		externalLabels := api.config().GlobalConfig.ExternalLabels.Clone()
-		filteredMatchers := make([]*labels.Matcher, 0, len(matchers))
-		for _, m := range matchers {
-			value := externalLabels[model.LabelName(m.Name)]
-			if m.Type == labels.MatchEqual && value == model.LabelValue(m.Value) {
-				matcher, err := labels.NewMatcher(labels.MatchEqual, m.Name, "")
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				filteredMatchers = append(filteredMatchers, matcher)
-			} else {
-				filteredMatchers = append(filteredMatchers, m)
-			}
-		}
-
-		set, err := querier.Select(nil, filteredMatchers...)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		resp.Results[i], err = remote.ToQueryResult(set)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Add external labels back in, in sorted order.
-		sortedExternalLabels := make([]*prompb.Label, 0, len(externalLabels))
-		for name, value := range externalLabels {
-			sortedExternalLabels = append(sortedExternalLabels, &prompb.Label{
-				Name:  string(name),
-				Value: string(value),
-			})
-		}
-		sort.Slice(sortedExternalLabels, func(i, j int) bool {
-			return sortedExternalLabels[i].Name < sortedExternalLabels[j].Name
-		})
-
-		for _, ts := range resp.Results[i].Timeseries {
-			ts.Labels = mergeLabels(ts.Labels, sortedExternalLabels)
-		}
-	}
-
-	if err := remote.EncodeReadResponse(&resp, w); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 }
 
 func (api *API) deleteSeries(r *http.Request) (interface{}, *apiError) {
